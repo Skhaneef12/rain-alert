@@ -1,0 +1,11 @@
+# Cloudflare Worker that answers Telegram instantly (commands, buttons, access requests).
+# Rain warnings and summaries are still sent by the GitHub Actions workflow.
+# Secrets (set by setup.ps1, never stored here): BOT_TOKEN, ADMIN_CHAT_IDS, WEBHOOK_SECRET
+name = "rain-alert-bot"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+# Keep these equal to the GitHub repository variables of the same name (used by /now).
+RAIN_MM_THRESHOLD = "0.2"
+RAIN_PROB_THRESHOLD = "40"

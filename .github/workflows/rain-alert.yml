@@ -1,0 +1,59 @@
+name: rain-alert
+
+# Minute 7 avoids GitHub's busiest time (the top of the hour), so runs start closer to schedule.
+# If you change a cron line, change the matching string in the "case" below too.
+on:
+  schedule:
+    - cron: "7 10 * * *"     # 07:07 Montevideo – today's summary
+    - cron: "7 11-22 * * *"  # 08:07-19:07 Montevideo – hourly warnings
+    - cron: "7 23 * * *"     # 20:07 Montevideo – last warning + tomorrow's preview
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which message to run"
+        type: choice
+        options: [hourly, daily, tomorrow]
+        default: hourly
+
+permissions:
+  contents: read
+
+# Never let a late run overlap the next one (both could edit the same pinned status message).
+concurrency:
+  group: rain-alert
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rain-alert
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run rain alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RAIN_MM_THRESHOLD: ${{ vars.RAIN_MM_THRESHOLD }}
+          RAIN_PROB_THRESHOLD: ${{ vars.RAIN_PROB_THRESHOLD }}
+          SCHEDULE: ${{ github.event.schedule }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          status=0
+          case "$SCHEDULE|$MODE" in
+            "7 10 * * *|" | "|daily")
+              python rain_alert.py --daily || status=1 ;;
+            "7 23 * * *|")
+              python rain_alert.py || status=1
+              python rain_alert.py --tomorrow || status=1 ;;
+            "|tomorrow")
+              python rain_alert.py --tomorrow || status=1 ;;
+            *)
+              python rain_alert.py || status=1 ;;
+          esac
+          exit $status
