@@ -96,14 +96,13 @@ Typing `/` in the chat shows the command menu.
 
 Settings take effect immediately, and the next scheduled alert respects them.
 
-**The pinned message is the bot's memory.** The first time a setting changes, the bot pins a status message in that chat, such as:
+**Where settings live.** Everyone's settings (who has access, who is waiting, on/off and mutes) are kept in permanent storage in your Cloudflare account (a KV store). Pinned messages play no part any more: you can pin, unpin or delete anything in the chat. Deploying new code doesn't touch the settings either.
 
-```
-📌 Rain alert status: OFF 🔕
-Commands: /now /on /off /status
-```
+Two safety rules protect access:
+- If the settings can't be read, the bot changes nothing and tells you to try again.
+- Only **🚫 Remove** in `/users` can take someone's access away. Any other change that would drop an approved person is refused, and the bot tells you straight away.
 
-In the owner's chat it also lists who has access (`👤`) and who is waiting for approval (`⏳`). The Worker and the GitHub job both read this message. **Don't unpin or delete it**, and don't pin another message after it. If the owner's status message is lost, everyone else loses access until approved again, and warnings go back to ON.
+Every change also keeps a copy of the previous settings, so a mistake can be undone.
 
 ---
 
@@ -121,7 +120,7 @@ Each approved person has their own on/off setting and their own **Clothes are in
 - **Repeat messages** while a request is waiting don't send you another request; they just get *"still waiting"*.
 - **Declined** people are told. They can ask again later, and you'll get a new request.
 - **Removing someone:** send `/users` and tap **🚫 Remove** next to their name. They're told, and stop getting alerts from the next check.
-- **Group chats:** someone adds the bot to a group and sends a message there; you get a request naming the group. Once approved, the whole group gets alerts and shares one setting, and anyone in the group can use the buttons. Make the bot a group **admin** that can pin messages, otherwise `/off` can't be remembered there.
+- **Group chats:** someone adds the bot to a group and sends a message there; you get a request naming the group. Once approved, the whole group gets alerts and shares one setting, and anyone in the group can use the buttons. The bot doesn't need to be a group admin.
 
 The **owner** is the chat id in the `TELEGRAM_CHAT_ID` secret (GitHub) and `ADMIN_CHAT_IDS` (Cloudflare), both set during setup. Only the owner gets requests and can use `/users`.
 
@@ -186,13 +185,15 @@ If a very broken-up day would make the message 400 characters or longer, the las
 ### Each scheduled run
 
 1. Fetch the forecast and check it is complete.
-2. Read the owner's pinned status (settings plus the approved list), then each approved chat's status.
-3. Decide each chat's message: warnings skip chats that are off or muted, while summaries go to everyone.
-4. Save any changed status messages, then send.
+2. Ask the Worker who should get alerts (`GET /api/recipients`, protected by `STATE_SECRET`): the owner plus everyone approved, each with their on/off and mute.
+3. Decide each chat's message: warnings skip chats that are off or muted today, while summaries go to everyone.
+4. Send. A "dry again" message also lifts that chat's mute (`POST /api/unmute`). The job never changes who has access.
+
+If the Worker can't be reached, the job still alerts the owner, so a warning is never lost, and the run is marked failed so you notice.
 
 ### The Worker
 
-Telegram sends every message and button tap straight to the Worker (a "webhook"), signed with a secret only Telegram and the Worker know. Anything without that secret is refused. The Worker reads and writes the same pinned status messages, so the GitHub job always sees the latest settings.
+Telegram sends every message and button tap straight to the Worker (a "webhook"), signed with a secret only Telegram and the Worker know. Anything without that secret is refused. The Worker is the only thing that changes settings, and the GitHub job reads them from it, so both always agree.
 
 ---
 
@@ -238,7 +239,7 @@ You only need this if you are setting the project up again (for example in a new
 
 If `getUpdates` returns `"result":[]`, send the bot another message and reload. Do this **before** step 5: once the Worker is connected, `getUpdates` no longer works. (Or skip steps 2–3 and use the `-GitHubRepo` shortcut in step 5.)
 
-### 3. Add the two GitHub secrets
+### 3. Add the GitHub secrets
 
 Repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**:
 
@@ -283,7 +284,7 @@ Needs a free [Cloudflare account](https://dash.cloudflare.com/sign-up) and [Node
 
    It ends with `SETUP-DONE`. Send `/status` to your bot; the reply should arrive within seconds.
 
-**Shortcut for a new repository:** add `-GitHubRepo <owner>/<repo>` and the script also saves `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` as that repository's GitHub secrets (using the GitHub CLI, `gh`, logged in to your account), so you can skip steps 2 and 3:
+**Use `-GitHubRepo <owner>/<repo>` (recommended).** The script then also saves `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `STATE_SECRET` and `WORKER_URL` as that repository's GitHub secrets (using the GitHub CLI, `gh`, logged in to your account), so you can skip steps 2 and 3. Every run creates a new `STATE_SECRET`, so without this option the GitHub job can't read the settings until you run it again with the option:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\worker\setup.ps1 -GitHubRepo <owner>/rain-alert
@@ -313,6 +314,30 @@ npx --yes wrangler@4.145.0 deploy --config worker/wrangler.toml
 ---
 
 ## Testing
+
+### Automated tests (run by GitHub on every change)
+
+The [`tests/`](tests) folder has offline tests for both parts. They use fake Telegram, Cloudflare and GitHub services, need no secrets, and make no network calls. The [`tests`](.github/workflows/tests.yml) workflow runs them on every push and pull request.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+```bash
+node --test tests/worker.test.mjs
+```
+
+They cover the alert messages and timing, forecast gaps and retries, late runs, who gets which alert, the access-request flow, and the safety rules: settings can't be lost by accident, and nothing is written when settings are unreadable. They also cover moving settings from the old pinned format, the Worker API and the schedule.
+
+### Making changes safely
+
+`main` is protected: changes go in through a pull request, and GitHub only allows merging once both test jobs pass. For a new feature:
+
+1. Create a branch, make the change, and add a test for it in `tests/`.
+2. Open a pull request and wait for the **tests** checks to turn green.
+3. Merge. The alerts use the new code from the next run.
+4. If `worker/` changed, deploy the Worker: `npx --yes wrangler@4.145.0 deploy --config worker/wrangler.toml`. Settings are untouched by deploys.
+
 
 ### On GitHub (sends real messages)
 
@@ -431,7 +456,7 @@ Scheduled job (`rain_alert.py`):
 | Forecast has missing values | Prints `Forecast is missing data for <time>; not sending anything.` | 1 |
 | `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` missing | Prints that they must be set | 1 |
 | A Telegram call fails | Retried up to 3 times: after 5 s for network errors and server errors, after Telegram's requested wait for "too many requests" (429). Other errors (wrong token, wrong chat id) are not retried. The other chats still get their messages. | 1 |
-| A pinned status can't be read | That chat is treated as warnings ON, so a warning is never lost by mistake | 1 |
+| The Worker's settings can't be read (or `WORKER_URL` / `STATE_SECRET` missing) | Alerts go to the owner only, so a warning is never lost; nobody's access changes | 1 |
 
 A non-zero exit marks the GitHub Actions run as failed (red).
 
@@ -464,10 +489,13 @@ Worker: if something goes wrong while handling a message, it logs a one-line rea
 - Using another tool that calls `setWebhook` or `deleteWebhook` on the same bot disconnects the Worker.
 
 **Someone approved isn't getting alerts**
-They're added from the next scheduled check. Send `/users` to confirm they're listed. If the owner's pinned status message was unpinned or deleted, the list is gone: they need to message the bot again and be re-approved.
+They're added from the next scheduled check. Send `/users` to confirm they're listed. If a run's log says *alerting the owner only*, the GitHub job couldn't reach the Worker: check the `WORKER_URL` and `STATE_SECRET` GitHub secrets (re-run `worker/setup.ps1 -GitHubRepo <owner>/rain-alert` to reset both).
 
-**`/off` was forgotten**
-The pinned status message was unpinned or deleted, or another message was pinned after it. Send `/off` again. In a group, make sure the bot is an admin that can pin messages.
+**I got "⚠️ I blocked a change that would have removed access…"**
+A bug tried to drop someone's access without `/users → Remove`. Nothing was changed. Please report it (open an issue).
+
+**I got "⚠️ My settings are temporarily unavailable"**
+Cloudflare's storage didn't answer. Nothing was changed; try again in a minute.
 
 **Run fails with `Telegram returned HTTP 401`**
 The token is wrong or was revoked. Update `TELEGRAM_BOT_TOKEN`, and run `worker/setup.ps1` again for the Worker.
@@ -505,7 +533,6 @@ The script switches its own output to UTF-8 for `--dry-run`; if your terminal fo
 - The schedule depends on the GitHub token, which expires (at most a year for fine-grained tokens). The Worker tells you when it does.
 - "Dry again" is worked out from the forecast for the past hour, not from measured rain.
 - The rain rule exists twice, in Python for the scheduled alerts and in JavaScript for `/now`. A change to the logic needs making in both files.
-- Everyone's access depends on the owner's pinned status message (see above).
 
 ---
 
@@ -516,12 +543,17 @@ The script switches its own output to UTF-8 for `--dry-run`; if your terminal fo
 ├── README.md                       This file
 ├── .github/
 │   └── workflows/
-│       └── rain-alert.yml          Schedules the alerts on GitHub Actions
+│       ├── rain-alert.yml          Sends the alerts (started by the Worker)
+│       └── tests.yml               Runs the tests on every push and pull request
 ├── rain-alert/
 │   ├── rain_alert.py               Scheduled alerts (forecast → messages → Telegram)
 │   └── requirements.txt            Python dependency: requests
-└── worker/
-    ├── src/index.js                Cloudflare Worker: commands, buttons, access requests
-    ├── wrangler.toml               Worker name and /now thresholds
-    └── setup.ps1                   One-time setup: deploy, secrets, connect Telegram
+├── worker/
+│   ├── src/index.js                Cloudflare Worker: schedule, commands, buttons, access requests, settings API
+│   ├── wrangler.toml               Worker name, schedule, settings store, /now thresholds
+│   ├── package.json                Marks src/index.js as a JavaScript module (no dependencies)
+│   └── setup.ps1                   One-time setup: deploy, secrets, connect Telegram
+└── tests/
+    ├── test_rain_alert.py          Offline tests for the alerts job
+    └── worker.test.mjs             Offline tests for the Worker
 ```

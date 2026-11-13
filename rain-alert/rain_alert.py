@@ -2,14 +2,14 @@
 
 Default: hourly warning. --daily: morning summary. --tomorrow: evening preview of tomorrow.
 Commands, buttons and access requests are answered instantly by the Cloudflare Worker in
-../worker; this script only reads the settings it saves in each chat's pinned status message.
+../worker, which keeps everyone's settings. This script asks the Worker who should get each
+alert (WORKER_URL + STATE_SECRET) and never changes who has access.
 """
 import argparse
 import os
-import re
 import sys
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import NamedTuple, Optional
 
 import requests
@@ -29,16 +29,6 @@ SLOT = timedelta(minutes=15)
 LOOKAHEAD = timedelta(hours=3)
 MAX_LATE = timedelta(minutes=45)  # skip a run that starts this long after its time slot
 
-# Pinned status message, shared with worker/src/index.js (keep both formats identical):
-#   📌 Rain alert status: ON 🔔
-#   👕 Warnings muted for today (2026-10-23)     (optional)
-#   👤 Ana – 123456789                            (owner's chat only: approved users)
-#   ⏳ Bruno – 987654321                          (owner's chat only: waiting for approval)
-#   Commands: /now /on /off /status
-STATUS_PREFIX = "📌 Rain alert status:"
-MUTE_RE = re.compile(r"Warnings muted for today \((\d{4}-\d{2}-\d{2})\)")
-APPROVED_RE = re.compile(r"^👤 (.+) – (-?\d+)$")
-PENDING_RE = re.compile(r"^⏳ (.+) – (-?\d+)$")
 WARNING_BUTTONS = {"inline_keyboard": [[
     {"text": "👕 Clothes are in", "callback_data": "clothes_in"},
     {"text": "🔕 Warnings off", "callback_data": "off"},
@@ -51,28 +41,14 @@ class Slot(NamedTuple):
     prob: int
 
 
-class ChatState:
-    """What the bot remembers per chat, stored in a message pinned in that chat."""
+class Recipient(NamedTuple):
+    id: str
+    on: bool             # warnings and "dry again" wanted
+    muted: Optional[str]  # "YYYY-MM-DD" while "Clothes are in" is active for that day
 
-    def __init__(self, on=True, muted: Optional[date] = None, msg_id: Optional[int] = None,
-                 approved: Optional[list] = None, pending: Optional[list] = None):
-        self.on, self.muted, self.msg_id = on, muted, msg_id
-        # (name, chat id) pairs; only the owner's status message has these. Kept as-is.
-        self.approved: list[tuple[str, str]] = approved or []
-        self.pending: list[tuple[str, str]] = pending or []
-        self.changed = False
 
-    def is_muted(self, today: date) -> bool:
-        return self.muted == today
-
-    def text(self) -> str:
-        lines = [f"{STATUS_PREFIX} {'ON 🔔' if self.on else 'OFF 🔕'}"]
-        if self.muted:
-            lines.append(f"👕 Warnings muted for today ({self.muted.isoformat()})")
-        lines += [f"👤 {name} – {cid}" for name, cid in self.approved]
-        lines += [f"⏳ {name} – {cid}" for name, cid in self.pending]
-        lines.append("Commands: /now /on /off /status")
-        return "\n".join(lines)
+class SettingsError(Exception):
+    pass
 
 
 class TelegramError(Exception):
@@ -302,32 +278,30 @@ def tg(method: str, **payload):
     raise TelegramError(method, status)
 
 
-def load_state(chat_id: str, today: date) -> ChatState:
-    pinned = tg("getChat", chat_id=chat_id).get("pinned_message") or {}
-    text = pinned.get("text", "")
-    if not (pinned.get("from", {}).get("is_bot") and text.startswith(STATUS_PREFIX)):
-        return ChatState()
-    lines = text.splitlines()
-    mute = MUTE_RE.search(text)
-    state = ChatState(on="OFF" not in lines[0],
-                      muted=date.fromisoformat(mute.group(1)) if mute else None,
-                      msg_id=pinned["message_id"],
-                      approved=[m.groups() for m in map(APPROVED_RE.match, lines) if m],
-                      pending=[m.groups() for m in map(PENDING_RE.match, lines) if m])
-    if state.muted and state.muted < today:  # yesterday's mute has expired
-        state.muted, state.changed = None, True
-    return state
-
-
-def save_state(chat_id: str, state: ChatState) -> None:
-    if state.msg_id:
+def worker_api(method: str, path: str, **kwargs):
+    """Call the Worker's settings API (2 attempts). Raises SettingsError on failure."""
+    url, secret = os.environ.get("WORKER_URL", "").rstrip("/"), os.environ.get("STATE_SECRET", "")
+    if not url or not secret:
+        raise SettingsError("WORKER_URL / STATE_SECRET not set")
+    for attempt in range(2):
         try:
-            tg("editMessageText", chat_id=chat_id, message_id=state.msg_id, text=state.text())
-            return
-        except TelegramError:
-            pass  # message gone or not editable: pin a new one
-    msg = tg("sendMessage", chat_id=chat_id, text=state.text(), disable_notification=True)
-    tg("pinChatMessage", chat_id=chat_id, message_id=msg["message_id"], disable_notification=True)
+            resp = requests.request(method, url + path, timeout=20,
+                                    headers={"authorization": f"Bearer {secret}"}, **kwargs)
+            if resp.status_code == 200:
+                return resp.json()
+            print(f"Worker {path} returned HTTP {resp.status_code}", file=sys.stderr)
+            if resp.status_code < 500:
+                break
+        except (requests.RequestException, ValueError) as exc:
+            print(f"Worker {path} failed: {type(exc).__name__}", file=sys.stderr)
+        if attempt == 0:
+            time.sleep(5)
+    raise SettingsError(path)
+
+
+def fetch_recipients() -> list[Recipient]:
+    chats = worker_api("GET", "/api/recipients")["chats"]
+    return [Recipient(str(c["id"]), bool(c["on"]), c.get("muted")) for c in chats]
 
 
 # ---------------------------------------------------------------- main
@@ -368,41 +342,29 @@ def main() -> None:
         sys.exit(1)
 
     failed = False
-    states: dict[str, ChatState] = {}
+    try:
+        recipients = fetch_recipients()
+    except SettingsError:
+        # Without the settings, still alert the owner(s) so a warning is never lost, and fail
+        # the run so it shows up. Nobody's access is changed.
+        print("Couldn't read the settings from the Worker; alerting the owner only.", file=sys.stderr)
+        failed = True
+        recipients = [Recipient(c, True, None) for c in admin_ids]
 
-    def read_state(chat_id: str) -> None:
-        nonlocal failed
-        try:
-            states[chat_id] = load_state(chat_id, now.date())
-        except TelegramError:
-            failed = True
-            states[chat_id] = ChatState()  # can't read it: default to warnings on
-
-    # The owner (first id) keeps the list of people they approved in their pinned status.
-    for chat_id in admin_ids:
-        read_state(chat_id)
-    for _, chat_id in states[admin_ids[0]].approved:
-        if chat_id not in states:
-            read_state(chat_id)
-
-    # Decide what each chat gets before saving state, so a "dry again" can lift today's mute.
+    today = now.date().isoformat()
     outgoing = []
-    for chat_id, state in states.items():
+    for r in recipients:
         if summary:
-            outgoing.append((chat_id, summary, None))
-        elif warning and state.on and not state.is_muted(now.date()):
-            outgoing.append((chat_id, warning, WARNING_BUTTONS))
-        elif dry and state.on:
-            outgoing.append((chat_id, dry, None))
-            if state.muted:
-                state.muted, state.changed = None, True
-
-    for chat_id, state in states.items():
-        if state.changed:
-            try:
-                save_state(chat_id, state)
-            except TelegramError:
-                failed = True
+            outgoing.append((r.id, summary, None))
+        elif warning and r.on and r.muted != today:
+            outgoing.append((r.id, warning, WARNING_BUTTONS))
+        elif dry and r.on:
+            outgoing.append((r.id, dry, None))
+            if r.muted:  # "dry again" lifts today's "Clothes are in", in case they go back out
+                try:
+                    worker_api("POST", "/api/unmute", json={"chat_id": r.id})
+                except SettingsError:
+                    failed = True
 
     sent = 0
     for chat_id, text, buttons in outgoing:
@@ -420,7 +382,7 @@ def main() -> None:
     if not outgoing:
         print("No rain expected in the next 3 hours; nothing sent." if not (warning or dry)
               else "Warnings are off or muted in every chat; nothing sent.")
-    print(f"Sent {sent} message(s) to {len(states)} chat(s).")
+    print(f"Sent {sent} message(s) to {len(recipients)} chat(s).")
     sys.exit(1 if failed else 0)
 
 

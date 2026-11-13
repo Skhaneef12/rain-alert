@@ -67,14 +67,25 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host 'Saving the secrets in Cloudflare...'
 $secret = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
-@{ BOT_TOKEN = $token; ADMIN_CHAT_IDS = $chatId; WEBHOOK_SECRET = $secret } | ConvertTo-Json -Compress |
-    npx --yes $wrangler secret bulk | Out-Null
+# Shared with the GitHub workflow so it can ask the Worker who gets alerts.
+$stateSecret = [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
+@{ BOT_TOKEN = $token; ADMIN_CHAT_IDS = $chatId; WEBHOOK_SECRET = $secret; STATE_SECRET = $stateSecret } |
+    ConvertTo-Json -Compress | npx --yes $wrangler secret bulk | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Host 'Saving the secrets failed.'; exit 1 }
 
 # Deploy again quietly, now that no prompts are left, to read the Worker's address.
 $out = npx --yes $wrangler deploy | Out-String
 $url = [regex]::Match($out, 'https://[^\s]+\.workers\.dev').Value
 if (-not $url) { Write-Host 'Could not find the Worker address in the deploy output.'; exit 1 }
+
+if ($GitHubRepo) {
+    gh secret set STATE_SECRET --repo $GitHubRepo --body $stateSecret
+    if ($LASTEXITCODE -eq 0) { gh secret set WORKER_URL --repo $GitHubRepo --body $url }
+    if ($LASTEXITCODE -ne 0) { Write-Host "Saving STATE_SECRET / WORKER_URL in $GitHubRepo failed."; exit 1 }
+} else {
+    Write-Host 'NOTE: a new STATE_SECRET was created. Run this again with -GitHubRepo <owner>/<repo> so the'
+    Write-Host 'GitHub workflow gets it too; until then scheduled alerts go to the owner only.'
+}
 
 Invoke-Telegram 'setWebhook' @{
     url = $url; secret_token = $secret; allowed_updates = @('message', 'callback_query')

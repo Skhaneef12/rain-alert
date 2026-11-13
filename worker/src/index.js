@@ -1,14 +1,9 @@
-// Telegram webhook for the rain-alert bot: answers commands, buttons and access requests
-// the moment they arrive. Scheduled rain warnings are sent by rain-alert/rain_alert.py.
-//
-// State lives in a message the bot pins in each chat (same format as rain_alert.py):
-//   📌 Rain alert status: ON 🔔
-//   👕 Warnings muted for today (2026-10-23)     (optional)
-//   👤 Ana – 123456789                            (owner's chat only: approved users)
-//   ⏳ Bruno – 987654321                          (owner's chat only: waiting for approval)
-//   Commands: /now /on /off /status
+// rain-alert Cloudflare Worker:
+// - Telegram webhook: answers commands, buttons and access requests the moment they arrive
+// - cron triggers: start the GitHub workflow that sends rain warnings (rain-alert/rain_alert.py)
+// - /api/*: lets that workflow read who gets alerts (settings live in Cloudflare KV, see below)
 
-const STATUS_PREFIX = "📌 Rain alert status:";
+const STATUS_PREFIX = "📌 Rain alert status:"; // old pinned format, read once for migration
 const TZ = "America/Montevideo";
 const LATITUDE = -34.91; // rounded to ~1 km on purpose; same forecast grid point as the exact address
 const LONGITUDE = -56.15;
@@ -22,6 +17,8 @@ const WARNINGS_ON_BUTTON = { inline_keyboard: [[{ text: "🔔 Warnings on", call
 
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/")) return handleApi(request, env, url);
     if (request.method !== "POST") return new Response("rain-alert-bot");
     if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== env.WEBHOOK_SECRET) {
       return new Response("forbidden", { status: 403 });
@@ -30,7 +27,7 @@ export default {
       await handleUpdate(await request.json(), env);
     } catch (err) {
       // Never log the error object itself: keep anything token-bearing out of the logs.
-      console.log(`update failed: ${err instanceof TelegramError ? err.message : err?.name}`);
+      console.log(`update failed: ${err instanceof TelegramError || err instanceof SettingsError ? err.message : err?.name}`);
     }
     return new Response("ok"); // always 200, or Telegram re-sends the same update
   },
@@ -80,10 +77,112 @@ export async function startCheck(event, env) {
   }
 }
 
+// ------------------------------------------------------------------ settings (Cloudflare KV)
+//
+// One JSON document under the key "state" in the STATE KV namespace:
+//   { version: 1,
+//     chats:    { "<chat id>": { on: true, muted: "2026-11-13" | null } },
+//     approved: [ { name, id } ],   people/groups the owner approved
+//     pending:  [ { name, id } ] }  requests waiting for the owner
+// The previous version is kept under "state:prev". Deploys and code changes never touch it.
+// Safety rules: if the settings can't be read, nothing is written; and a change that would drop
+// an approved person is refused (and the owner told) unless it comes from /users → Remove.
+
+const STATE_KEY = "state";
+
+export class SettingsError extends Error {}
+
+function blankState() {
+  return { version: 1, chats: {}, approved: [], pending: [] };
+}
+
+export async function loadSettings(env) {
+  let raw;
+  try {
+    raw = await env.STATE.get(STATE_KEY);
+  } catch {
+    throw new SettingsError("settings storage unavailable");
+  }
+  if (raw) return JSON.parse(raw);
+  return migrateFromPinned(env);
+}
+
+// First run only: copy what the old pinned status messages held, then store it.
+async function migrateFromPinned(env) {
+  const admins = adminIds(env);
+  const state = blankState();
+  let note = "📦 Settings are now kept in permanent storage (no pinned message needed any more).";
+  try {
+    const owner = parseState((await tg(env, "getChat", { chat_id: admins[0] })).pinned_message);
+    state.chats[admins[0]] = { on: owner.on, muted: owner.muted };
+    state.approved = owner.approved;
+    state.pending = owner.pending;
+    for (const u of owner.approved) {
+      const s = parseState((await tg(env, "getChat", { chat_id: u.id })).pinned_message);
+      state.chats[u.id] = { on: s.on, muted: s.muted };
+    }
+    note += ` Copied: ${owner.approved.length} approved, ${owner.pending.length} waiting. You can unpin the old status message.`;
+  } catch {
+    note += " The old status message couldn't be read, so I started with only you having access.";
+  }
+  await env.STATE.put(STATE_KEY, JSON.stringify(state));
+  await send(env, admins[0], note).catch(() => {});
+  return state;
+}
+
+export async function saveSettings(env, before, after, { removing = [] } = {}) {
+  const dropped = before.approved.filter(
+    (u) => !after.approved.some((a) => a.id === u.id) && !removing.includes(u.id));
+  if (dropped.length) {
+    await send(env, adminIds(env)[0], `⚠️ I blocked a change that would have removed access for ${dropped.map((u) => u.name).join(", ")}. Nothing was changed. Please report this – it's a bug.`).catch(() => {});
+    throw new SettingsError("refused: would drop approved users");
+  }
+  await env.STATE.put("state:prev", JSON.stringify(before));
+  await env.STATE.put(STATE_KEY, JSON.stringify(after));
+}
+
+export function chatSettings(state, chatId, today = localDate()) {
+  const s = state.chats[chatId] || { on: true, muted: null };
+  return { on: s.on !== false, muted: s.muted && s.muted >= today ? s.muted : null };
+}
+
+function adminIds(env) {
+  return env.ADMIN_CHAT_IDS.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+// ------------------------------------------------------------------ API for the GitHub job
+
+async function handleApi(request, env, url) {
+  if (!env.STATE_SECRET || request.headers.get("authorization") !== `Bearer ${env.STATE_SECRET}`) {
+    return new Response("forbidden", { status: 403 });
+  }
+  const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  try {
+    const state = await loadSettings(env);
+    if (request.method === "GET" && url.pathname === "/api/recipients") {
+      const ids = [...new Set([...adminIds(env), ...state.approved.map((u) => u.id)])];
+      return json(200, { chats: ids.map((id) => ({ id, ...chatSettings(state, id) })) });
+    }
+    if (request.method === "POST" && url.pathname === "/api/unmute") {
+      const { chat_id: id } = await request.json();
+      const after = structuredClone(state);
+      if (after.chats[id]?.muted) {
+        after.chats[id].muted = null;
+        await saveSettings(env, state, after);
+      }
+      return json(200, { ok: true });
+    }
+    return json(404, { error: "not found" });
+  } catch (err) {
+    console.log(`api failed: ${err?.message || err?.name}`);
+    return json(503, { error: "settings unavailable" });
+  }
+}
+
 // ------------------------------------------------------------------ updates
 
 export async function handleUpdate(update, env) {
-  const admins = env.ADMIN_CHAT_IDS.split(",").map((s) => s.trim()).filter(Boolean);
+  const admins = adminIds(env);
   const ownerId = admins[0];
   const cb = update.callback_query;
   const msg = cb ? cb.message : update.message;
@@ -92,40 +191,47 @@ export async function handleUpdate(update, env) {
   const action = cb ? cb.data || "" : commandOf(msg.text);
 
   try {
-    const owner = await loadState(env, ownerId);
+    let state;
+    try {
+      state = await loadSettings(env);
+    } catch (err) {
+      // Never guess: without the settings we change nothing.
+      if (action || cb) await send(env, chatId, "⚠️ My settings are temporarily unavailable, so I didn't change anything. Please try again in a minute.").catch(() => {});
+      throw err;
+    }
+    const before = structuredClone(state);
     const isAdmin = admins.includes(chatId);
-    if (!isAdmin && !owner.approved.some((u) => u.id === chatId)) {
-      if (!cb) await handleStranger(env, ownerId, owner, msg);
+    if (!isAdmin && !state.approved.some((u) => u.id === chatId)) {
+      if (!cb) await handleStranger(env, ownerId, before, state, msg);
       return;
     }
-    const state = chatId === ownerId ? owner : await loadState(env, chatId);
     const today = localDate();
-    if (state.muted && state.muted < today) state.muted = null;
+    const mine = chatSettings(state, chatId, today);
+    const setMine = (s) => { state.chats[chatId] = s; };
 
     const [verb, target] = action.split(":");
     if (isAdmin && ["approve", "decline", "remove"].includes(verb) && target) {
-      await handleAdminDecision(env, ownerId, owner, verb, target, cb);
+      await handleAdminDecision(env, ownerId, before, state, verb, target, cb);
     } else if (verb === "off") {
-      state.on = false;
-      await saveState(env, chatId, state);
+      setMine({ ...mine, on: false });
+      await saveSettings(env, before, state);
       await send(env, chatId, "🔕 Rain warnings are off. You'll still get the morning and evening summaries.", WARNINGS_ON_BUTTON);
     } else if (verb === "on") {
-      state.on = true;
-      state.muted = null;
-      await saveState(env, chatId, state);
+      setMine({ on: true, muted: null });
+      await saveSettings(env, before, state);
       await send(env, chatId, "🔔 Rain warnings are on.");
     } else if (verb === "clothes_in") {
-      state.muted = today;
-      await saveState(env, chatId, state);
+      setMine({ ...mine, muted: today });
+      await saveSettings(env, before, state);
       await send(env, chatId, "👕 Got it – no more rain warnings today. I'll still tell you when it's dry again.");
     } else if (verb === "now") {
       await send(env, chatId, await nowMessage(env));
     } else if (verb === "status") {
-      let status = state.on ? "🔔 Rain warnings are on." : "🔕 Rain warnings are off.";
-      if (state.on && state.muted === today) status += " Muted for the rest of today (clothes are in).";
+      let status = mine.on ? "🔔 Rain warnings are on." : "🔕 Rain warnings are off.";
+      if (mine.on && mine.muted === today) status += " Muted for the rest of today (clothes are in).";
       await send(env, chatId, `${status}\n\n${isAdmin ? OWNER_HELP : HELP}`);
     } else if (verb === "users" && isAdmin) {
-      await sendUserList(env, chatId, owner);
+      await sendUserList(env, chatId, state);
     } else if (verb === "start" || verb === "help") {
       await send(env, chatId, `☔ I warn you about rain at home.\n\n${isAdmin ? OWNER_HELP : HELP}`);
     }
@@ -140,16 +246,16 @@ function commandOf(text) {
   return t.startsWith("/") ? t.split(/\s+/)[0].slice(1).split("@")[0].toLowerCase() : "";
 }
 
-async function handleStranger(env, ownerId, owner, msg) {
+async function handleStranger(env, ownerId, before, state, msg) {
   const chatId = String(msg.chat.id);
-  if (owner.pending.some((u) => u.id === chatId)) {
+  if (state.pending.some((u) => u.id === chatId)) {
     await send(env, chatId, "⏳ Your request is still waiting for the owner. You'll get a message here when they decide.");
     return;
   }
   const name = displayName(msg);
   const username = msg.chat.type === "private" && msg.from?.username ? ` (@${msg.from.username})` : "";
-  owner.pending.push({ name, id: chatId });
-  await saveState(env, ownerId, owner); // record it first, so repeat messages don't re-notify
+  state.pending.push({ name, id: chatId });
+  await saveSettings(env, before, state); // record it first, so repeat messages don't re-notify
   await send(env, ownerId, `👤 ${name}${username} wants rain alerts${msg.chat.type === "private" ? "" : " in their group"}.`, {
     inline_keyboard: [[
       { text: "✅ Approve", callback_data: `approve:${chatId}` },
@@ -159,17 +265,17 @@ async function handleStranger(env, ownerId, owner, msg) {
   await send(env, chatId, "👋 Hi! This bot sends rain alerts for one home. I've asked the owner to give you access – you'll get a message here as soon as they decide.");
 }
 
-async function handleAdminDecision(env, ownerId, owner, verb, target, cb) {
-  const pending = owner.pending.find((u) => u.id === target);
-  const approved = owner.approved.find((u) => u.id === target);
+async function handleAdminDecision(env, ownerId, before, state, verb, target, cb) {
+  const pending = state.pending.find((u) => u.id === target);
+  const approved = state.approved.find((u) => u.id === target);
   let note;
   if (verb === "approve") {
     if (!pending) {
       note = approved ? `${approved.name} already has access.` : "That request is no longer pending.";
     } else {
-      owner.pending = owner.pending.filter((u) => u.id !== target);
-      owner.approved.push(pending);
-      await saveState(env, ownerId, owner);
+      state.pending = state.pending.filter((u) => u.id !== target);
+      state.approved.push(pending);
+      await saveSettings(env, before, state);
       note = `✅ ${pending.name} approved. They'll get rain alerts from the next check.`;
       await send(env, target, `✅ You're in! You'll get rain alerts for home.\n\n${HELP}`).catch(() => {});
     }
@@ -177,8 +283,8 @@ async function handleAdminDecision(env, ownerId, owner, verb, target, cb) {
     if (!pending) {
       note = "That request is no longer pending.";
     } else {
-      owner.pending = owner.pending.filter((u) => u.id !== target);
-      await saveState(env, ownerId, owner);
+      state.pending = state.pending.filter((u) => u.id !== target);
+      await saveSettings(env, before, state);
       note = `❌ ${pending.name} declined.`;
       await send(env, target, "Sorry, the owner didn't approve access to these rain alerts.").catch(() => {});
     }
@@ -186,8 +292,9 @@ async function handleAdminDecision(env, ownerId, owner, verb, target, cb) {
     if (!approved) {
       note = "They no longer have access.";
     } else {
-      owner.approved = owner.approved.filter((u) => u.id !== target);
-      await saveState(env, ownerId, owner);
+      state.approved = state.approved.filter((u) => u.id !== target);
+      delete state.chats[target];
+      await saveSettings(env, before, state, { removing: [target] });
       note = `🚫 ${approved.name} removed. They won't get rain alerts any more.`;
       await send(env, target, "Your access to these rain alerts was removed by the owner.").catch(() => {});
     }
@@ -200,16 +307,16 @@ async function handleAdminDecision(env, ownerId, owner, verb, target, cb) {
   }
 }
 
-async function sendUserList(env, chatId, owner) {
-  if (!owner.approved.length && !owner.pending.length) {
+async function sendUserList(env, chatId, state) {
+  if (!state.approved.length && !state.pending.length) {
     await send(env, chatId, "Only you have access. When someone messages the bot, you'll get a request to approve here.");
     return;
   }
   const lines = [
-    ...owner.approved.map((u) => `👤 ${u.name}`),
-    ...owner.pending.map((u) => `⏳ ${u.name} (waiting for your answer above)`),
+    ...state.approved.map((u) => `👤 ${u.name}`),
+    ...state.pending.map((u) => `⏳ ${u.name} (waiting for your answer above)`),
   ];
-  const buttons = owner.approved.map((u) => [{ text: `🚫 Remove ${u.name}`, callback_data: `remove:${u.id}` }]);
+  const buttons = state.approved.map((u) => [{ text: `🚫 Remove ${u.name}`, callback_data: `remove:${u.id}` }]);
   await send(env, chatId, `People with access besides you:\n${lines.join("\n")}`, buttons.length ? { inline_keyboard: buttons } : undefined);
 }
 
@@ -217,20 +324,18 @@ function displayName(msg) {
   const raw = msg.chat.type === "private"
     ? [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ")
     : msg.chat.title;
-  // Keep it to one line and free of the "–" separator used in the pinned status format.
-  const name = (raw || "").replace(/[\r\n–]+/g, " ").trim().slice(0, 40);
+  const name = (raw || "").replace(/[\r\n]+/g, " ").trim().slice(0, 40);
   return name || "Someone";
 }
 
-// ------------------------------------------------------------------ state (pinned message)
+// ------------------------------------------------------------------ old pinned format (migration only)
 
 export function parseState(pinned) {
-  const state = { on: true, muted: null, approved: [], pending: [], msgId: null };
+  const state = { on: true, muted: null, approved: [], pending: [] };
   const text = pinned?.text || "";
   if (!pinned?.from?.is_bot || !text.startsWith(STATUS_PREFIX)) return state;
   const lines = text.split("\n");
   state.on = !lines[0].includes("OFF");
-  state.msgId = pinned.message_id;
   for (const line of lines) {
     let m;
     if ((m = line.match(/Warnings muted for today \((\d{4}-\d{2}-\d{2})\)/))) state.muted = m[1];
@@ -238,35 +343,6 @@ export function parseState(pinned) {
     else if ((m = line.match(/^⏳ (.+) – (-?\d+)$/u))) state.pending.push({ name: m[1], id: m[2] });
   }
   return state;
-}
-
-export function renderState(state) {
-  const lines = [`${STATUS_PREFIX} ${state.on ? "ON 🔔" : "OFF 🔕"}`];
-  if (state.muted) lines.push(`👕 Warnings muted for today (${state.muted})`);
-  for (const u of state.approved) lines.push(`👤 ${u.name} – ${u.id}`);
-  for (const u of state.pending) lines.push(`⏳ ${u.name} – ${u.id}`);
-  lines.push("Commands: /now /on /off /status");
-  return lines.join("\n");
-}
-
-async function loadState(env, chatId) {
-  const chat = await tg(env, "getChat", { chat_id: chatId });
-  return parseState(chat.pinned_message);
-}
-
-async function saveState(env, chatId, state) {
-  const text = renderState(state);
-  if (state.msgId) {
-    try {
-      await tg(env, "editMessageText", { chat_id: chatId, message_id: state.msgId, text });
-      return;
-    } catch {
-      // message gone or not editable: pin a new one
-    }
-  }
-  const sent = await tg(env, "sendMessage", { chat_id: chatId, text, disable_notification: true });
-  await tg(env, "pinChatMessage", { chat_id: chatId, message_id: sent.message_id, disable_notification: true });
-  state.msgId = sent.message_id;
 }
 
 // ------------------------------------------------------------------ telegram
