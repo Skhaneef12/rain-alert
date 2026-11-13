@@ -40,6 +40,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          STATE_SECRET: ${{ secrets.STATE_SECRET }}
           RAIN_MM_THRESHOLD: ${{ vars.RAIN_MM_THRESHOLD }}
           RAIN_PROB_THRESHOLD: ${{ vars.RAIN_PROB_THRESHOLD }}
           SCHEDULED_AT: ${{ inputs.scheduled_at }}
