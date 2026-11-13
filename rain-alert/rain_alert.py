@@ -27,6 +27,7 @@ TIMEZONE = "America/Montevideo"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 SLOT = timedelta(minutes=15)
 LOOKAHEAD = timedelta(hours=3)
+MAX_LATE = timedelta(minutes=45)  # skip a run that starts this long after its time slot
 
 # Pinned status message, shared with worker/src/index.js (keep both formats identical):
 #   📌 Rain alert status: ON 🔔
@@ -91,18 +92,36 @@ def fetch_forecast() -> dict:
         "timezone": TIMEZONE,
         "forecast_days": 3,
     }
-    for attempt in range(2):
+    waits = [10, 30]  # seconds between the 3 attempts; Open-Meteo sometimes stalls briefly
+    for attempt in range(3):
         try:
-            resp = requests.get(FORECAST_URL, params=params, timeout=20)
+            resp = requests.get(FORECAST_URL, params=params, timeout=30)
             if resp.status_code == 200:
                 return resp.json()
             print(f"Open-Meteo returned HTTP {resp.status_code}", file=sys.stderr)
         except (requests.RequestException, ValueError) as exc:
             print(f"Open-Meteo request failed: {type(exc).__name__}", file=sys.stderr)
-        if attempt == 0:
-            time.sleep(5)
-    print("Forecast unavailable after retry; not sending anything.", file=sys.stderr)
+        if attempt < len(waits):
+            time.sleep(waits[attempt])
+    print("Forecast unavailable after 3 attempts; not sending anything.", file=sys.stderr)
     sys.exit(1)
+
+
+def too_late() -> bool:
+    """True if this run started more than MAX_LATE after the time slot it was started for.
+
+    The Cloudflare Worker passes that slot as SCHEDULED_AT (UTC, ISO 8601). Manual runs have none.
+    A stale run must not send an evening preview after midnight or a warning for a past hour.
+    """
+    scheduled_at = os.environ.get("SCHEDULED_AT")
+    if not scheduled_at:
+        return False
+    late = datetime.now(timezone.utc) - datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+    if late <= MAX_LATE:
+        return False
+    print(f"This run started {late.total_seconds() / 60:.0f} min after its {scheduled_at} slot; "
+          "too late to be useful, not sending anything.")
+    return True
 
 
 def build_slots(data: dict) -> tuple[datetime, list[Slot]]:
@@ -321,6 +340,8 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="print the message instead of sending it (no Telegram calls)")
     args = parser.parse_args()
+    if not args.dry_run and too_late():
+        return
 
     now, slots = build_slots(fetch_forecast())
     midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())

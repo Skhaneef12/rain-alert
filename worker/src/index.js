@@ -34,7 +34,51 @@ export default {
     }
     return new Response("ok"); // always 200, or Telegram re-sends the same update
   },
+
+  // Cloudflare cron trigger (see [triggers] in wrangler.toml): start the GitHub workflow.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(startCheck(event, env));
+  },
 };
+
+// ------------------------------------------------------------------ schedule
+
+const SLOT_MODES = { "7 10 * * *": "daily", "7 23 * * *": "evening" }; // anything else: hourly
+
+export async function startCheck(event, env) {
+  const mode = SLOT_MODES[event.cron] || "hourly";
+  const scheduledAt = new Date(event.scheduledTime).toISOString();
+  const url = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/rain-alert.yml/dispatches`;
+  let status = 0;
+  for (let attempt = 0; attempt < 3 && status !== 204; attempt++) {
+    if (attempt) await sleep(5000);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${env.GITHUB_TOKEN}`,
+          accept: "application/vnd.github+json",
+          "x-github-api-version": "2022-11-28",
+          "user-agent": "rain-alert-bot",
+        },
+        body: JSON.stringify({ ref: "main", inputs: { mode, scheduled_at: scheduledAt } }),
+      });
+      status = res.status;
+      if ([401, 403, 404, 422].includes(status)) break; // won't fix itself by retrying
+    } catch {
+      status = 0;
+    }
+  }
+  if (status === 204) return;
+  console.log(`starting the ${mode} check failed: HTTP ${status}`);
+  if (mode === "daily") {
+    // Once a day at most, so an expired token doesn't mean silence nobody notices.
+    const ownerId = env.ADMIN_CHAT_IDS.split(",")[0].trim();
+    const why = status === 401 ? "the GitHub token was rejected – it may have expired"
+      : status === 0 ? "GitHub didn't answer" : `GitHub answered HTTP ${status}`;
+    await send(env, ownerId, `⚠️ I couldn't start this morning's rain check: ${why}. See "Troubleshooting" in the README.`).catch(() => {});
+  }
+}
 
 // ------------------------------------------------------------------ updates
 

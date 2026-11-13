@@ -11,8 +11,8 @@ All times are Montevideo time (America/Montevideo, UTC-3). It uses the free [Ope
 
 | Part | Runs on | Does |
 |---|---|---|
-| [`rain-alert/rain_alert.py`](rain-alert/rain_alert.py) | GitHub Actions, on a schedule | Rain warnings, "dry again", morning and evening summaries |
-| [`worker/src/index.js`](worker/src/index.js) | A Cloudflare Worker, always on | Replies to commands and buttons within seconds, handles access requests |
+| [`rain-alert/rain_alert.py`](rain-alert/rain_alert.py) | GitHub Actions, started by the Worker at each time slot | Rain warnings, "dry again", morning and evening summaries |
+| [`worker/src/index.js`](worker/src/index.js) | A Cloudflare Worker, always on | Keeps the schedule; replies to commands and buttons within seconds; handles access requests |
 
 ---
 
@@ -198,21 +198,25 @@ Telegram sends every message and button tap straight to the Worker (a "webhook")
 
 ## Schedule
 
-The workflow is in [`.github/workflows/rain-alert.yml`](.github/workflows/rain-alert.yml). GitHub cron times are in **UTC**; Montevideo is UTC-3 all year (no daylight saving time).
+The **Cloudflare Worker keeps time**, using Cloudflare's scheduled triggers (`[triggers]` in [`worker/wrangler.toml`](worker/wrangler.toml)). At each time slot it asks GitHub to start the workflow in [`.github/workflows/rain-alert.yml`](.github/workflows/rain-alert.yml) straight away, telling it which check to run and which time slot it is for. Times are in **UTC**; Montevideo is UTC-3 all year (no daylight saving time).
 
-| Cron (UTC) | Montevideo time | Runs |
-|---|---|---|
-| `7 10 * * *` | 07:07 | `python rain_alert.py --daily` |
-| `7 11-22 * * *` | 08:07, 09:07 … 19:07 (12 runs) | `python rain_alert.py` |
-| `7 23 * * *` | 20:07 | `python rain_alert.py`, then `python rain_alert.py --tomorrow` |
+| Trigger (UTC) | Montevideo time | Mode | Runs |
+|---|---|---|---|
+| `7 10 * * *` | 07:07 | `daily` | `python rain_alert.py --daily` |
+| `7 11-22 * * *` | 08:07, 09:07 … 19:07 (12 runs) | `hourly` | `python rain_alert.py` |
+| `7 23 * * *` | 20:07 | `evening` | `python rain_alert.py`, then `python rain_alert.py --tomorrow` |
 
-The runs are at minute 7 because GitHub is busiest at the top of each hour, when scheduled runs are most often late.
+**Why not GitHub's own schedule?** It's best-effort. For this repo it dropped about 70% of the runs (3–5 of 14 a day) and started others hours late, so the workflow no longer has a schedule of its own. Cloudflare's triggers fire on time, and GitHub starts a requested run within seconds to a minute.
 
-The job reads `github.event.schedule` to know which cron fired and picks the command from that. It can also be started by hand (**Actions → rain-alert → Run workflow**) with a choice of `hourly`, `daily` or `tomorrow`.
+**Late runs are skipped.** Each run gets its time slot as `SCHEDULED_AT`. If it starts more than 45 minutes later (`MAX_LATE` in `rain_alert.py`), it sends nothing and says so in the log, so you never get an evening preview after midnight or a warning for an hour that has passed.
+
+**If the Worker can't start the 07:07 check** (for example, the GitHub token expired), it sends the owner a Telegram message saying so. Other failed slots are only logged, so an expired token means one message a day, not fourteen.
+
+You can also start the workflow by hand (**Actions → rain-alert → Run workflow**) and choose `hourly`, `daily`, `evening` or `tomorrow`. Manual runs have no time slot, so they are never skipped.
 
 Each run checks out the repo, installs Python 3.12 and `requests`, then runs the script from the `rain-alert/` folder with the secrets and variables passed in as environment variables. Runs never overlap. The workflow only has read access to the repository.
 
-> **This repository is public, so the 60-day rule applies.** GitHub turns off scheduled workflows in a public repository after 60 days without any commit. If the morning summary stops arriving, open **Actions → rain-alert** and click **Enable workflow**, or make any small commit. A calendar reminder every ~50 days avoids the gap.
+Because the workflow has no GitHub schedule, GitHub's rule that turns off scheduled workflows in public repos after 60 days without commits doesn't affect it.
 
 ---
 
@@ -253,7 +257,7 @@ gh secret set TELEGRAM_CHAT_ID --repo <owner>/rain-alert
 
 ### 4. Push
 
-Scheduled workflows only run from the repository's **default branch** (`main`). Once the files and secrets are there, the next cron time will run automatically.
+The Worker starts the workflow on the `main` branch. Nothing runs on a schedule until step 5 is done.
 
 ### 5. Set up the Cloudflare Worker
 
@@ -284,6 +288,21 @@ Needs a free [Cloudflare account](https://dash.cloudflare.com/sign-up) and [Node
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\worker\setup.ps1 -GitHubRepo <owner>/rain-alert
 ```
+
+**Give the Worker permission to start the workflow.** This is what makes the schedule work.
+
+1. In GitHub, go to **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**.
+2. Name it `rain-alert-worker`, choose the longest expiration offered, and under **Repository access** pick **Only select repositories → rain-alert**.
+3. Under **Repository permissions**, set **Actions** to **Read and write**. Leave everything else as is, then generate the token and copy it.
+4. Save it in Cloudflare (paste when asked; it's hidden):
+
+   ```bash
+   npx --yes wrangler@4.145.0 secret put GITHUB_TOKEN --config worker/wrangler.toml
+   ```
+
+Set a reminder for shortly before the token expires. When it does, the Worker messages you at 07:07 instead of starting the check; create a new token and repeat step 4.
+
+The repository the Worker starts is `GITHUB_REPO` in `worker/wrangler.toml`. Change it there if yours is named differently.
 
 Run the script again after changing `worker/wrangler.toml` or the Telegram setup. It's safe to repeat. For a code-only change to `worker/src/index.js`, deploying is enough (no token needed):
 
@@ -392,8 +411,8 @@ Constants at the top of [`rain-alert/rain_alert.py`](rain-alert/rain_alert.py) (
 | `TIMEZONE` / `TZ` | `America/Montevideo` | Timezone of the forecast times and messages |
 | `LOOKAHEAD` | 3 hours | How far ahead warnings and "dry again" look |
 
-- **Different hours?** Edit the cron lines in the workflow. Remember they are UTC: Montevideo time + 3 hours. Also change the matching cron string in the `case` block of the workflow's `run:` step, because that is how it tells the runs apart.
-- **Different location or timezone?** Change the constants in both files, and the cron times if the UTC offset differs.
+- **Different hours?** Edit `crons` under `[triggers]` in `worker/wrangler.toml` (UTC: Montevideo time + 3 hours), and `SLOT_MODES` in `worker/src/index.js` if you change the 07:07 or 20:07 lines, then deploy the Worker.
+- **Different location or timezone?** Change the constants in both files, and the trigger times if the UTC offset differs.
 
 ---
 
@@ -407,13 +426,14 @@ Scheduled job (`rain_alert.py`):
 | Hourly mode, no rain soon | Prints `No rain expected in the next 3 hours; nothing sent.` | 0 |
 | Warning due, but every chat is off or muted | Prints `Warnings are off or muted in every chat; nothing sent.` | 0 |
 | An approved person has blocked the bot | Prints a note to remove them with `/users`; everyone else still gets their message | 0 |
-| Open-Meteo fails (network error, timeout, non-200, bad JSON) | Waits 5 s and retries once. If it fails again, prints `Forecast unavailable after retry; not sending anything.` **No guessed alert or summary is sent.** | 1 |
+| Run started more than 45 min after its time slot | Prints that it is too late and sends nothing | 0 |
+| Open-Meteo fails (network error, 30 s timeout, non-200, bad JSON) | Tries 3 times, waiting 10 s and then 30 s. If all fail, prints `Forecast unavailable after 3 attempts; not sending anything.` **No guessed alert or summary is sent.** | 1 |
 | Forecast has missing values | Prints `Forecast is missing data for <time>; not sending anything.` | 1 |
 | `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` missing | Prints that they must be set | 1 |
 | A Telegram call fails | Retried up to 3 times: after 5 s for network errors and server errors, after Telegram's requested wait for "too many requests" (429). Other errors (wrong token, wrong chat id) are not retried. The other chats still get their messages. | 1 |
 | A pinned status can't be read | That chat is treated as warnings ON, so a warning is never lost by mistake | 1 |
 
-A non-zero exit marks the GitHub Actions run as failed (red), and by default GitHub emails you about failed scheduled runs.
+A non-zero exit marks the GitHub Actions run as failed (red).
 
 Worker: if something goes wrong while handling a message, it logs a one-line reason (visible with `wrangler tail`) and still answers Telegram, so the same message isn't redelivered over and over. If the forecast can't be fetched or is incomplete, `/now` says so rather than guessing.
 
@@ -433,7 +453,8 @@ Worker: if something goes wrong while handling a message, it logs a one-line rea
 ## Troubleshooting
 
 **No morning message at ~07:07**
-- GitHub can start scheduled runs late, typically by 5–30 minutes and more at busy times. A run can occasionally be skipped altogether.
+- Watch the Worker's log around a time slot: `npx --yes wrangler@4.145.0 tail --config worker/wrangler.toml`. A line like `starting the daily check failed: HTTP 401` means the GitHub token expired or lacks **Actions: Read and write** (see step 5).
+- In **Actions → rain-alert**, a run that says *too late to be useful* started more than 45 minutes after its slot.
 - Check **Actions → rain-alert** for a failed (red) run and open its log.
 - Check that both secrets exist: **Settings → Secrets and variables → Actions**.
 
@@ -457,13 +478,16 @@ Usually a wrong owner chat id in `TELEGRAM_CHAT_ID`. Fix the secret. The Worker 
 **Run fails with `Telegram returned HTTP 403`**
 You blocked the bot. Unblock it. (An approved person blocking it only prints a note, see above.)
 
-**Run fails with `Forecast unavailable after retry` or `Forecast is missing data`**
+**I got "⚠️ I couldn't start this morning's rain check"**
+The Worker couldn't start the workflow. If it says the token was rejected, create a new GitHub token (step 5) and save it with `wrangler secret put GITHUB_TOKEN`.
+
+**Run fails with `Forecast unavailable after 3 attempts` or `Forecast is missing data`**
 Open-Meteo was down or sent an incomplete forecast. The next hourly run will try again; nothing needs to be done.
 
 **Scheduled runs stopped completely**
+- Check the Worker is deployed and has its triggers: Cloudflare dashboard → **Workers & Pages → rain-alert-bot → Settings → Triggers**.
 - Check **Actions** → **rain-alert** is not disabled (a "This workflow was disabled" banner).
-- In **public** repositories, GitHub disables scheduled workflows after 60 days without repository activity. Re-enable it in the Actions tab.
-- In **private** repositories, runs use your GitHub Actions minutes. GitHub rounds each job up to a whole minute, so 14 runs a day is about 420 of the 2,000 free minutes a month on the Free plan.
+- The GitHub token may have expired (see above).
 
 **Getting the same warning every hour**
 Expected while rain is coming or falling. Tap **👕 Clothes are in** to stop them for the day.
@@ -478,6 +502,7 @@ The script switches its own output to UTF-8 for `--dry-run`; if your terminal fo
 - It is only as good as the forecast. Short, local showers are hard for any forecast to pin down to the 15 minutes.
 - Outside Central Europe and North America, Open-Meteo's 15-minute data is interpolated from hourly forecast models, so the timing is closer to "within the hour" than "to the minute".
 - Warnings only run 08:07–20:07. There are no warnings at night.
+- The schedule depends on the GitHub token, which expires (at most a year for fine-grained tokens). The Worker tells you when it does.
 - "Dry again" is worked out from the forecast for the past hour, not from measured rain.
 - The rain rule exists twice, in Python for the scheduled alerts and in JavaScript for `/now`. A change to the logic needs making in both files.
 - Everyone's access depends on the owner's pinned status message (see above).

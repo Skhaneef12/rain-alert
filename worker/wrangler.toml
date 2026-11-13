@@ -1,11 +1,22 @@
-# Cloudflare Worker that answers Telegram instantly (commands, buttons, access requests).
-# Rain warnings and summaries are still sent by the GitHub Actions workflow.
-# Secrets (set by setup.ps1, never stored here): BOT_TOKEN, ADMIN_CHAT_IDS, WEBHOOK_SECRET
+# Cloudflare Worker that answers Telegram instantly (commands, buttons, access requests)
+# and keeps time: on each trigger below it starts the GitHub Actions workflow that sends
+# rain warnings and summaries.
+# Secrets (never stored here): BOT_TOKEN, ADMIN_CHAT_IDS, WEBHOOK_SECRET (set by setup.ps1)
+# and GITHUB_TOKEN (fine-grained token allowed to run this repo's workflow).
 name = "rain-alert-bot"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+# UTC times; Montevideo is UTC-3 all year. Modes are set in src/index.js (SLOT_MODES).
+[triggers]
+crons = [
+  "7 10 * * *",     # 07:07 Montevideo – today's summary
+  "7 11-22 * * *",  # 08:07-19:07 – hourly warnings
+  "7 23 * * *",     # 20:07 – last warning + tomorrow's preview
+]
+
 [vars]
+GITHUB_REPO = "Skhaneef12/rain-alert"
 # Keep these equal to the GitHub repository variables of the same name (used by /now).
 RAIN_MM_THRESHOLD = "0.2"
 RAIN_PROB_THRESHOLD = "40"
