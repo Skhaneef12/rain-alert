@@ -262,6 +262,49 @@ test("API forecast: Open-Meteo down -> 502, not an empty forecast", async () => 
   assert.equal((await api("/api/forecast")).status, 502);
 });
 
+// ---- lost access recovery
+const daily = () => startCheck({ cron: "7 10 * * *", scheduledTime: Date.now() }, env);
+
+test("lost access: roster remembers approved people; if they vanish from settings they're told to ask again, owner told once", async () => {
+  await approveAna();
+  kv.store.set("state", JSON.stringify({ version: 1, chats: {}, approved: [], pending: [] })); // simulate the accident
+  await daily();
+  assert.match(to(ANA)[0].text, /lost/);
+  assert.equal(to(ANA)[0].markup.inline_keyboard[0][0].callback_data, "reaccess");
+  assert.match(to(OWNER)[0].text, /Ana lost access/);
+  clear();
+  await daily(); // not repeated
+  assert.equal(to(ANA).length + to(OWNER).length, 0);
+});
+
+test("lost access: tapping the button (or an old warning button) files a request marked 'had access before'", async () => {
+  await approveAna();
+  kv.store.set("state", JSON.stringify({ version: 1, chats: {}, approved: [], pending: [] }));
+  await daily(); clear();
+  await tap(ANA, "clothes_in"); // stale button from an old warning
+  assert.match(to(OWNER)[0].text, /had access before/);
+  assert.match(to(ANA)[0].text, /don't have access right now/);
+  await tap(OWNER, `approve:${ANA}`, 51);
+  assert.equal(kv.doc().approved.length, 1);
+});
+
+test("people the owner removed or declined are never told they lost access", async () => {
+  await approveAna();
+  await tap(OWNER, `remove:${ANA}`); clear();
+  await daily();
+  assert.equal(to(ANA).length, 0);
+  await say(EVE, "hi", "Eve"); await tap(OWNER, `decline:${EVE}`, 52); clear();
+  await daily();
+  assert.equal(to(EVE).length, 0);
+});
+
+test("lost access: nothing is sent or written when settings can't be read", async () => {
+  await approveAna(); clear();
+  kv.failGet = true;
+  await daily();
+  assert.equal(tgState.sent.filter((m) => /lost/.test(m.text)).length, 0);
+});
+
 // ---- schedule
 test("schedule: slots map to modes and pass the time slot", async () => {
   for (const [cron, mode] of [["7 10 * * *", "daily"], ["7 23 * * *", "evening"], ["7 11-22 * * *", "hourly"]]) {
