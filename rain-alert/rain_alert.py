@@ -96,6 +96,7 @@ def fetch_forecast() -> dict:
                 if resp.status_code == 200:
                     data = resp.json()
                     if "minutely_15" in data and "hourly" in data:
+                        print(f"Forecast fetched via the {name} route.")
                         return data
                     print(f"{name} forecast route returned an unexpected answer", file=sys.stderr)
                 else:
