@@ -157,6 +157,11 @@ async function handleApi(request, env, url) {
     return new Response("forbidden", { status: 403 });
   }
   const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  if (request.method === "GET" && url.pathname === "/api/forecast") {
+    // Second route to Open-Meteo for the GitHub job, whose shared addresses often get refused.
+    const data = await fetchForecast(3);
+    return data ? json(200, data) : json(502, { error: "forecast unavailable" });
+  }
   try {
     const state = await loadSettings(env);
     if (request.method === "GET" && url.pathname === "/api/recipients") {
@@ -390,9 +395,9 @@ function localDate() {
 
 const hhmm = (t) => new Date(t).toISOString().slice(11, 16);
 
-export async function fetchForecast() {
+export async function fetchForecast(days = 2) {
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${LATITUDE}&longitude=${LONGITUDE}` +
-    `&minutely_15=precipitation&hourly=precipitation_probability&timezone=${encodeURIComponent(TZ)}&forecast_days=2`;
+    `&minutely_15=precipitation&hourly=precipitation_probability&timezone=${encodeURIComponent(TZ)}&forecast_days=${days}`;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(10000) });

@@ -139,7 +139,7 @@ Each scheduled run calls the Open-Meteo forecast API for the house's area (latit
 
 Open-Meteo labels each value with the **end** of its interval (a 15-minute value at 14:15 covers 14:00–14:15; an hourly value at 15:00 covers 14:00–15:00). The code converts everything to the **start** of the interval, so "rain around 14:00" means rain begins at 14:00. Each 15-minute slot is paired with the probability of the hour it falls in.
 
-**Incomplete forecasts are never reported as "no rain".** Before writing any message, the script checks that every 15-minute slot it needs has both values: from now until midnight, or the next 3 hours if later, and all of tomorrow for the evening preview. If any are missing it stops with exit code 1 and sends nothing, the same as when the API is down. `/now` does the same check and replies that the forecast is incomplete.
+**Incomplete forecasts are never reported as "no rain".** Before writing any message, the script checks that every 15-minute slot it needs has both values: from now until midnight, or the next 3 hours if later, and all of tomorrow for the evening preview. If any are missing it sends no alert, the same as when the forecast can't be fetched (see [Errors and exit codes](#errors-and-exit-codes)). `/now` does the same check and replies that the forecast is incomplete.
 
 ### What counts as rain
 
@@ -184,7 +184,7 @@ If a very broken-up day would make the message 400 characters or longer, the las
 
 ### Each scheduled run
 
-1. Fetch the forecast and check it is complete.
+1. Fetch the forecast and check it is complete. There are two routes: through the Worker (`GET /api/forecast`), which reaches Open-Meteo from Cloudflare's network, and directly from GitHub as a backup. Open-Meteo often refuses or ignores GitHub's shared addresses (HTTP 429, timeouts), which caused repeated failures in November 2026. Both routes are tried, then again after 10 s, 30 s, 1, 2 and 3 minutes: about 10 minutes in all.
 2. Ask the Worker who should get alerts (`GET /api/recipients`, protected by `STATE_SECRET`): the owner plus everyone approved, each with their on/off and mute.
 3. Decide each chat's message: warnings skip chats that are off or muted today, while summaries go to everyone.
 4. Send. A "dry again" message also lifts that chat's mute (`POST /api/unmute`). The job never changes who has access.
@@ -452,13 +452,12 @@ Scheduled job (`rain_alert.py`):
 | Warning due, but every chat is off or muted | Prints `Warnings are off or muted in every chat; nothing sent.` | 0 |
 | An approved person has blocked the bot | Prints a note to remove them with `/users`; everyone else still gets their message | 0 |
 | Run started more than 45 min after its time slot | Prints that it is too late and sends nothing | 0 |
-| Open-Meteo fails (network error, 30 s timeout, non-200, bad JSON) | Tries 3 times, waiting 10 s and then 30 s. If all fail, prints `Forecast unavailable after 3 attempts; not sending anything.` **No guessed alert or summary is sent.** | 1 |
-| Forecast has missing values | Prints `Forecast is missing data for <time>; not sending anything.` | 1 |
+| Forecast can't be fetched over either route for ~10 minutes, or has missing values | **No guessed alert or summary is sent.** The run stays green with a `Forecast unavailable` warning in its log, because an outage at the weather service isn't a fault in the job. If it was the morning summary or the evening preview, the owner gets a Telegram note saying it wasn't sent. A missed hourly check is only logged. | 0 |
 | `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` missing | Prints that they must be set | 1 |
 | A Telegram call fails | Retried up to 3 times: after 5 s for network errors and server errors, after Telegram's requested wait for "too many requests" (429). Other errors (wrong token, wrong chat id) are not retried. The other chats still get their messages. | 1 |
 | The Worker's settings can't be read (or `WORKER_URL` / `STATE_SECRET` missing) | Alerts go to the owner only, so a warning is never lost; nobody's access changes | 1 |
 
-A non-zero exit marks the GitHub Actions run as failed (red).
+A non-zero exit marks the GitHub Actions run as failed (red). That now means something needs fixing (a token, a secret, the Worker), not that the weather service had a bad moment.
 
 Worker: if something goes wrong while handling a message, it logs a one-line reason (visible with `wrangler tail`) and still answers Telegram, so the same message isn't redelivered over and over. If the forecast can't be fetched or is incomplete, `/now` says so rather than guessing.
 
@@ -509,8 +508,8 @@ You blocked the bot. Unblock it. (An approved person blocking it only prints a n
 **I got "⚠️ I couldn't start this morning's rain check"**
 The Worker couldn't start the workflow. If it says the token was rejected, create a new GitHub token (step 5) and save it with `wrangler secret put GITHUB_TOKEN`.
 
-**Run fails with `Forecast unavailable after 3 attempts` or `Forecast is missing data`**
-Open-Meteo was down or sent an incomplete forecast. The next hourly run will try again; nothing needs to be done.
+**I got "⚠️ I couldn't get the weather forecast…"**
+Open-Meteo couldn't be reached over either route for about 10 minutes, or sent an incomplete forecast, so a summary was skipped rather than guessed. Nothing needs doing; the next check tries again. Send `/now` for the current outlook. To see how often checks are skipped, look for `Forecast unavailable` warnings in **Actions → rain-alert**.
 
 **Scheduled runs stopped completely**
 - Check the Worker is deployed and has its triggers: Cloudflare dashboard → **Workers & Pages → rain-alert-bot → Settings → Triggers**.

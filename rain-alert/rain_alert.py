@@ -27,6 +27,7 @@ TIMEZONE = "America/Montevideo"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 SLOT = timedelta(minutes=15)
 LOOKAHEAD = timedelta(hours=3)
+FORECAST_WAITS = [10, 30, 60, 120, 180]  # seconds between rounds of forecast attempts
 MAX_LATE = timedelta(minutes=45)  # skip a run that starts this long after its time slot
 
 WARNING_BUTTONS = {"inline_keyboard": [[
@@ -51,6 +52,10 @@ class SettingsError(Exception):
     pass
 
 
+class ForecastUnavailable(Exception):
+    """The forecast can't be fetched or has gaps. An outage, not a fault in this job."""
+
+
 class TelegramError(Exception):
     def __init__(self, method: str, status: int = 0):
         super().__init__(method)
@@ -59,7 +64,12 @@ class TelegramError(Exception):
 
 # ---------------------------------------------------------------- forecast
 
-def fetch_forecast() -> dict:
+def forecast_routes() -> list[tuple[str, str, dict, dict]]:
+    """Ways to reach the forecast: (name, url, params, headers), best first.
+
+    Open-Meteo often refuses or ignores GitHub's shared addresses (HTTP 429, timeouts), so the
+    Cloudflare Worker fetches it for us when it is configured; the direct call is the backup.
+    """
     params = {
         "latitude": LATITUDE,
         "longitude": LONGITUDE,
@@ -68,19 +78,33 @@ def fetch_forecast() -> dict:
         "timezone": TIMEZONE,
         "forecast_days": 3,
     }
-    waits = [10, 30]  # seconds between the 3 attempts; Open-Meteo sometimes stalls briefly
-    for attempt in range(3):
-        try:
-            resp = requests.get(FORECAST_URL, params=params, timeout=30)
-            if resp.status_code == 200:
-                return resp.json()
-            print(f"Open-Meteo returned HTTP {resp.status_code}", file=sys.stderr)
-        except (requests.RequestException, ValueError) as exc:
-            print(f"Open-Meteo request failed: {type(exc).__name__}", file=sys.stderr)
-        if attempt < len(waits):
-            time.sleep(waits[attempt])
-    print("Forecast unavailable after 3 attempts; not sending anything.", file=sys.stderr)
-    sys.exit(1)
+    routes = []
+    url, secret = os.environ.get("WORKER_URL", "").rstrip("/"), os.environ.get("STATE_SECRET", "")
+    if url and secret:
+        routes.append(("Worker", url + "/api/forecast", {}, {"authorization": f"Bearer {secret}"}))
+    routes.append(("Open-Meteo", FORECAST_URL, params, {}))
+    return routes
+
+
+def fetch_forecast() -> dict:
+    """Try every route, then wait and try again, for about 10 minutes in all."""
+    routes = forecast_routes()
+    for round_no in range(len(FORECAST_WAITS) + 1):
+        for name, url, params, headers in routes:
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "minutely_15" in data and "hourly" in data:
+                        return data
+                    print(f"{name} forecast route returned an unexpected answer", file=sys.stderr)
+                else:
+                    print(f"{name} forecast route returned HTTP {resp.status_code}", file=sys.stderr)
+            except (requests.RequestException, ValueError) as exc:
+                print(f"{name} forecast route failed: {type(exc).__name__}", file=sys.stderr)
+        if round_no < len(FORECAST_WAITS):
+            time.sleep(FORECAST_WAITS[round_no])
+    raise ForecastUnavailable(f"no forecast after {len(FORECAST_WAITS) + 1} rounds over every route")
 
 
 def too_late() -> bool:
@@ -139,9 +163,7 @@ def require_coverage(now: datetime, slots: list[Slot], until: datetime) -> None:
     t = now.replace(minute=now.minute // 15 * 15, second=0, microsecond=0)
     while t < until:
         if t not in have:
-            print(f"Forecast is missing data for {t:%Y-%m-%d %H:%M}; not sending anything.",
-                  file=sys.stderr)
-            sys.exit(1)
+            raise ForecastUnavailable(f"forecast is missing data for {t:%Y-%m-%d %H:%M}")
         t += SLOT
 
 
@@ -306,6 +328,32 @@ def fetch_recipients() -> list[Recipient]:
 
 # ---------------------------------------------------------------- main
 
+def forecast_outage(args, reason: str) -> int:
+    """No usable forecast: send no alert (never guess). Returns the exit code.
+
+    An outage at the weather service is not a fault in this job, so the run stays green with a
+    warning in its log. A missed summary is told to the owner on Telegram; a missed hourly
+    check is only logged, because the next one is an hour away.
+    """
+    print(f"::warning title=Forecast unavailable::{reason}; no alert sent.")
+    if args.dry_run:
+        return 1
+    what = "this morning's summary" if args.daily else "tomorrow's preview" if args.tomorrow else None
+    if not what:
+        return 0
+    owners = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
+    if not os.environ.get("TELEGRAM_BOT_TOKEN") or not owners:
+        print("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.", file=sys.stderr)
+        return 1
+    try:
+        tg("sendMessage", chat_id=owners[0],
+           text=f"⚠️ I couldn't get the weather forecast, so {what} wasn't sent. "
+                "Hourly checks continue; send /now to try for the current outlook.")
+    except TelegramError:
+        return 1
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
@@ -317,10 +365,13 @@ def main() -> None:
     if not args.dry_run and too_late():
         return
 
-    now, slots = build_slots(fetch_forecast())
-    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
-    until = midnight + timedelta(days=1) if args.tomorrow else max(midnight, now + LOOKAHEAD)
-    require_coverage(now, slots, until)
+    try:
+        now, slots = build_slots(fetch_forecast())
+        midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+        until = midnight + timedelta(days=1) if args.tomorrow else max(midnight, now + LOOKAHEAD)
+        require_coverage(now, slots, until)
+    except ForecastUnavailable as exc:
+        sys.exit(forecast_outage(args, str(exc)))
 
     if args.daily:
         summary, warning, dry = daily_message(now, slots), None, None

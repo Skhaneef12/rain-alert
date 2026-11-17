@@ -129,34 +129,134 @@ class Messages(unittest.TestCase):
         self.assertTrue(msg.startswith("🌙 Tomorrow's rain forecast: 14:00-17:00"), msg)
 
 
-class ForecastSafety(unittest.TestCase):
-    def test_gap_in_forecast_exits_without_sending(self):
+GOOD = {"minutely_15": {}, "hourly": {}}
+
+
+def ok(body=None):
+    return mock.Mock(status_code=200, json=lambda: body or GOOD)
+
+
+class ForecastRoutes(unittest.TestCase):
+    """Fetching the forecast: Worker route first, direct route as backup, ~10 minutes of tries."""
+
+    def fetch(self, answers, env=ENV):
+        """answers: per call, a response, an exception, or an HTTP status. Returns (result, urls, sleeps)."""
+        urls = []
+
+        def get(url, params, headers, timeout):
+            urls.append((url, headers.get("authorization")))
+            x = answers.pop(0) if answers else 429
+            if isinstance(x, Exception):
+                raise x
+            return mock.Mock(status_code=x) if isinstance(x, int) else x
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(ra.requests, "get", get), \
+             mock.patch.object(ra.time, "sleep") as sleep, redirect_stderr(io.StringIO()) as err:
+            for k in ("WORKER_URL", "STATE_SECRET"):
+                if k not in env:
+                    os.environ.pop(k, None)
+            try:
+                result = ra.fetch_forecast()
+            except ra.ForecastUnavailable as e:
+                result = e
+        return result, urls, [c.args[0] for c in sleep.call_args_list], err.getvalue()
+
+    def test_worker_route_is_tried_first_with_the_secret(self):
+        result, urls, sleeps, _ = self.fetch([ok()])
+        self.assertEqual(result, GOOD)
+        self.assertEqual(urls, [("https://worker.example/api/forecast", "Bearer s3cret")])
+        self.assertEqual(sleeps, [])
+
+    def test_direct_route_is_the_backup_and_gets_no_secret(self):
+        result, urls, sleeps, _ = self.fetch([502, ok()])
+        self.assertEqual(result, GOOD)
+        self.assertEqual(urls[1], (ra.FORECAST_URL, None))
+        self.assertEqual(sleeps, [])
+
+    def test_both_routes_refused_then_recovers_after_waiting(self):
+        # The 14-16 Nov failures: 429 and timeouts for about 2 minutes.
+        result, urls, sleeps, _ = self.fetch([429, 429, ra.requests.ReadTimeout(), 429, 429, 429, ok()])
+        self.assertEqual(result, GOOD)
+        self.assertEqual(sleeps, [10, 30, 60])
+
+    def test_gives_up_only_after_about_ten_minutes(self):
+        result, urls, sleeps, err = self.fetch([])
+        self.assertIsInstance(result, ra.ForecastUnavailable)
+        self.assertEqual(sleeps, [10, 30, 60, 120, 180])
+        self.assertGreaterEqual(sum(sleeps), 400)
+        self.assertEqual(len(urls), 12)  # 6 rounds x 2 routes
+        self.assertNotIn("s3cret", err)
+
+    def test_without_worker_config_only_the_direct_route_is_used(self):
+        env = {k: v for k, v in ENV.items() if k not in ("WORKER_URL", "STATE_SECRET")}
+        result, urls, sleeps, _ = self.fetch([ok()], env=env)
+        self.assertEqual(urls, [(ra.FORECAST_URL, None)])
+
+    def test_garbage_answer_is_not_accepted(self):
+        result, urls, sleeps, _ = self.fetch([ok({"error": True}), ok()])
+        self.assertEqual(result, GOOD)
+        self.assertEqual(len(urls), 2)
+
+
+class ForecastOutage(unittest.TestCase):
+    """No usable forecast: never guess, never go red for the weather service's outage."""
+
+    def outage(self, args, fake=None):
+        fake = fake or FakeServices()
+
+        def down():
+            raise ra.ForecastUnavailable("no forecast after 6 rounds over every route")
+        with mock.patch.object(ra, "fetch_forecast", down):
+            out, err, code = io.StringIO(), io.StringIO(), 0
+            with mock.patch.dict(os.environ, ENV, clear=False), mock.patch.object(ra.requests, "post", fake.post), \
+                 mock.patch.object(ra.requests, "request", fake.request), mock.patch.object(ra.time, "sleep"), \
+                 mock.patch.object(sys, "argv", ["rain_alert.py", *args]), redirect_stdout(out), redirect_stderr(err):
+                os.environ.pop("SCHEDULED_AT", None)
+                try:
+                    ra.main()
+                except SystemExit as e:
+                    code = e.code or 0
+        return code, out.getvalue(), fake
+
+    def test_hourly_outage_is_green_logged_and_silent(self):
+        code, out, fake = self.outage([])
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.sent, [])
+        self.assertIn("::warning title=Forecast unavailable::", out)
+
+    def test_missed_summaries_are_told_to_the_owner_only(self):
+        for args, what in ((["--daily"], "this morning's summary"), (["--tomorrow"], "tomorrow's preview")):
+            fake = FakeServices([{"id": OWNER, "on": True, "muted": None}, {"id": ANA, "on": True, "muted": None}])
+            code, out, fake = self.outage(args, fake)
+            self.assertEqual(code, 0)
+            self.assertEqual([c for c, _, _ in fake.sent], [OWNER])
+            self.assertIn(what, fake.sent[0][1])
+            self.assertNotIn("rain expected", fake.sent[0][1].lower())  # states no forecast
+
+    def test_owner_note_failing_is_a_real_failure(self):
+        fake = FakeServices()
+        fake.blocked = {OWNER}
+        code, out, fake = self.outage(["--daily"], fake)
+        self.assertEqual(code, 1)
+
+    def test_dry_run_outage_exits_nonzero_without_telegram(self):
+        code, out, fake = self.outage(["--daily", "--dry-run"])
+        self.assertEqual(code, 1)
+        self.assertEqual(fake.sent, [])
+
+    def test_gap_in_forecast_is_an_outage_not_no_rain(self):
         fake = FakeServices()
         gap = [s for s in make_slots(NOW, [(45, 120)]) if s.start != datetime(2026, 10, 23, 15, 0)]
         code, out, err = run(fake, ["--daily"], slots=gap)
+        self.assertEqual(code, 0)
+        self.assertIn("missing data for 2026-10-23 15:00", out)
+        self.assertEqual(len(fake.sent), 1)
+        self.assertIn("couldn't get the weather forecast", fake.sent[0][1])
+        self.assertNotIn("No rain", fake.sent[0][1])
+
+    def test_real_faults_still_fail(self):
+        fake = FakeServices(api_status=503)  # settings unreadable
+        code, out, err = run(fake, [], slots=make_slots(NOW, [(45, 120)]))
         self.assertEqual(code, 1)
-        self.assertEqual(fake.sent, [])
-        self.assertIn("missing data", err)
-
-    def test_forecast_retries_then_succeeds(self):
-        seq = [ra.requests.ReadTimeout(), ra.requests.ReadTimeout(), mock.Mock(status_code=200, json=lambda: {"ok": 1})]
-
-        def get(*a, **k):
-            x = seq.pop(0)
-            if isinstance(x, Exception):
-                raise x
-            return x
-        with mock.patch.object(ra.requests, "get", get), mock.patch.object(ra.time, "sleep") as sleep, \
-             redirect_stderr(io.StringIO()):
-            self.assertEqual(ra.fetch_forecast(), {"ok": 1})
-        self.assertEqual([c.args[0] for c in sleep.call_args_list], [10, 30])
-
-    def test_forecast_gives_up_after_3(self):
-        with mock.patch.object(ra.requests, "get", side_effect=ra.requests.ReadTimeout()), \
-             mock.patch.object(ra.time, "sleep"), redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as e:
-                ra.fetch_forecast()
-        self.assertEqual(e.exception.code, 1)
 
 
 class LateRuns(unittest.TestCase):

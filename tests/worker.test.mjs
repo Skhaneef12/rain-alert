@@ -243,6 +243,25 @@ test("/now: forecast down or incomplete is said plainly, never 'no rain'", async
   assert.match(to(OWNER)[0].text, /isn't answering/);
 });
 
+// ---- forecast route for the GitHub job
+test("API forecast: needs the secret, asks for 3 days, works even if settings storage is down", async () => {
+  assert.equal((await api("/api/forecast", { auth: "Bearer wrong" })).status, 403);
+  tgState.forecast = { minutely_15: { time: [] }, hourly: { time: [] }, utc_offset_seconds: -10800 };
+  kv.failGet = true;
+  let asked = "";
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (url, o) => { if (String(url).includes("open-meteo")) asked = String(url); return inner(url, o); };
+  const r = await api("/api/forecast");
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), tgState.forecast);
+  assert.match(asked, /forecast_days=3/);
+  assert.equal(kv.puts, 0);
+});
+
+test("API forecast: Open-Meteo down -> 502, not an empty forecast", async () => {
+  assert.equal((await api("/api/forecast")).status, 502);
+});
+
 // ---- schedule
 test("schedule: slots map to modes and pass the time slot", async () => {
   for (const [cron, mode] of [["7 10 * * *", "daily"], ["7 23 * * *", "evening"], ["7 11-22 * * *", "hourly"]]) {
