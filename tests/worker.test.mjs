@@ -263,7 +263,7 @@ test("API forecast: Open-Meteo down -> 502, not an empty forecast", async () => 
 });
 
 // ---- lost access recovery
-const daily = () => startCheck({ cron: "7 10 * * *", scheduledTime: Date.now() }, env);
+const daily = () => startCheck({ cron: "7 12 * * *", scheduledTime: Date.now() }, env); // an hourly slot
 
 test("lost access: roster remembers approved people; if they vanish from settings they're told to ask again, owner told once", async () => {
   await approveAna();

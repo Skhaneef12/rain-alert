@@ -44,7 +44,7 @@ const SLOT_MODES = { "7 10 * * *": "daily", "7 23 * * *": "evening" }; // anythi
 
 export async function startCheck(event, env) {
   const mode = SLOT_MODES[event.cron] || "hourly";
-  if (mode === "daily") await checkAccess(env).catch(() => {}); // never lets this block the rain check
+  await checkAccess(env).catch(() => {}); // every check, so a loss is noticed within the hour; never blocks the rain check
   const scheduledAt = new Date(event.scheduledTime).toISOString();
   const url = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/rain-alert.yml/dispatches`;
   let status = 0;
@@ -146,7 +146,7 @@ export async function saveSettings(env, before, after, { removing = [] } = {}) {
 //
 // A second KV key, "roster", remembers everyone the owner ever approved (and whether they were
 // later removed on purpose). If someone is on the roster but not in "state", access was lost by
-// accident: each morning the Worker tells them to request it again and tells the owner, and the
+// accident: within the hour (every scheduled check) the Worker tells them to request it again and tells the owner, and the
 // moment they message the bot they get a fresh request. Failures here never block anything else.
 
 const ROSTER_KEY = "roster";
@@ -178,7 +178,7 @@ export function lostPeople(state, roster, admins) {
   return roster.filter((r) => !r.removed && !admins.includes(r.id) && !state.approved.some((u) => u.id === r.id));
 }
 
-// Daily: make sure the roster knows everyone approved, then tell anyone who lost access.
+// Every scheduled check: make sure the roster knows everyone approved, then tell anyone who lost access.
 export async function checkAccess(env) {
   const admins = adminIds(env);
   let state;
