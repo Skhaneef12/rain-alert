@@ -44,6 +44,7 @@ const SLOT_MODES = { "7 10 * * *": "daily", "7 23 * * *": "evening" }; // anythi
 
 export async function startCheck(event, env) {
   const mode = SLOT_MODES[event.cron] || "hourly";
+  if (mode === "daily") await checkAccess(env).catch(() => {}); // never lets this block the rain check
   const scheduledAt = new Date(event.scheduledTime).toISOString();
   const url = `https://api.github.com/repos/${env.GITHUB_REPO}/actions/workflows/rain-alert.yml/dispatches`;
   let status = 0;
@@ -141,6 +142,63 @@ export async function saveSettings(env, before, after, { removing = [] } = {}) {
   await env.STATE.put(STATE_KEY, JSON.stringify(after));
 }
 
+// ------------------------------------------------------------------ roster: who ever had access
+//
+// A second KV key, "roster", remembers everyone the owner ever approved (and whether they were
+// later removed on purpose). If someone is on the roster but not in "state", access was lost by
+// accident: each morning the Worker tells them to request it again and tells the owner, and the
+// moment they message the bot they get a fresh request. Failures here never block anything else.
+
+const ROSTER_KEY = "roster";
+
+async function loadRoster(env) {
+  try {
+    const raw = await env.STATE.get(ROSTER_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveRoster(env, roster) {
+  try { await env.STATE.put(ROSTER_KEY, JSON.stringify(roster)); } catch { /* best effort */ }
+}
+
+async function updateRoster(env, people, patch) {
+  const roster = await loadRoster(env);
+  for (const p of people) {
+    const i = roster.findIndex((r) => r.id === p.id);
+    if (i >= 0) roster[i] = { ...roster[i], name: p.name || roster[i].name, ...patch };
+    else roster.push({ id: p.id, name: p.name, ...patch });
+  }
+  await saveRoster(env, roster);
+}
+
+export function lostPeople(state, roster, admins) {
+  return roster.filter((r) => !r.removed && !admins.includes(r.id) && !state.approved.some((u) => u.id === r.id));
+}
+
+// Daily: make sure the roster knows everyone approved, then tell anyone who lost access.
+export async function checkAccess(env) {
+  const admins = adminIds(env);
+  let state;
+  try { state = await loadSettings(env); } catch { return; } // can't tell: change and say nothing
+  await updateRoster(env, state.approved.filter((u) => !admins.includes(u.id)), { removed: false });
+  const roster = await loadRoster(env);
+  const told = [];
+  for (const r of lostPeople(state, roster, admins).filter((x) => !x.notified)) {
+    try {
+      await send(env, r.id, "🔑 Your access to the rain alerts was lost because of a problem on my side – sorry! Tap the button to ask the owner for access again.",
+        { inline_keyboard: [[{ text: "🔑 Request access again", callback_data: "reaccess" }]] });
+      told.push(r);
+    } catch { /* blocked the bot, or chat gone: try again tomorrow */ }
+  }
+  if (told.length) {
+    await updateRoster(env, told, { notified: true });
+    await send(env, admins[0], `⚠️ ${told.map((r) => r.name).join(", ")} lost access by accident. I asked ${told.length > 1 ? "them" : "them"} to request it again – you'll get an Approve button when they do.`).catch(() => {});
+  }
+}
+
 export function chatSettings(state, chatId, today = localDate()) {
   const s = state.chats[chatId] || { on: true, muted: null };
   return { on: s.on !== false, muted: s.muted && s.muted >= today ? s.muted : null };
@@ -207,7 +265,11 @@ export async function handleUpdate(update, env) {
     const before = structuredClone(state);
     const isAdmin = admins.includes(chatId);
     if (!isAdmin && !state.approved.some((u) => u.id === chatId)) {
-      if (!cb) await handleStranger(env, ownerId, before, state, msg);
+      // A message, or an old button (e.g. under a rain warning) from someone without access.
+      const old = ["reaccess", "on", "off", "clothes_in", "now", "status"];
+      if (!cb || old.includes(action.split(":")[0])) {
+        await handleStranger(env, ownerId, before, state, { chat: msg.chat, from: cb ? cb.from : msg.from });
+      }
       return;
     }
     const today = localDate();
@@ -258,16 +320,19 @@ async function handleStranger(env, ownerId, before, state, msg) {
     return;
   }
   const name = displayName(msg);
+  const known = (await loadRoster(env)).some((r) => r.id === chatId && !r.removed);
   const username = msg.chat.type === "private" && msg.from?.username ? ` (@${msg.from.username})` : "";
   state.pending.push({ name, id: chatId });
   await saveSettings(env, before, state); // record it first, so repeat messages don't re-notify
-  await send(env, ownerId, `👤 ${name}${username} wants rain alerts${msg.chat.type === "private" ? "" : " in their group"}.`, {
+  await send(env, ownerId, `👤 ${name}${username}${known ? " (had access before)" : ""} wants rain alerts${msg.chat.type === "private" ? "" : " in their group"}.`, {
     inline_keyboard: [[
       { text: "✅ Approve", callback_data: `approve:${chatId}` },
       { text: "❌ Decline", callback_data: `decline:${chatId}` },
     ]],
   });
-  await send(env, chatId, "👋 Hi! This bot sends rain alerts for one home. I've asked the owner to give you access – you'll get a message here as soon as they decide.");
+  await send(env, chatId, known
+    ? "🔑 You don't have access right now, so I've asked the owner again – you'll get a message here as soon as they decide."
+    : "👋 Hi! This bot sends rain alerts for one home. I've asked the owner to give you access – you'll get a message here as soon as they decide.");
 }
 
 async function handleAdminDecision(env, ownerId, before, state, verb, target, cb) {
@@ -281,6 +346,7 @@ async function handleAdminDecision(env, ownerId, before, state, verb, target, cb
       state.pending = state.pending.filter((u) => u.id !== target);
       state.approved.push(pending);
       await saveSettings(env, before, state);
+      await updateRoster(env, [pending], { removed: false, notified: false });
       note = `✅ ${pending.name} approved. They'll get rain alerts from the next check.`;
       await send(env, target, `✅ You're in! You'll get rain alerts for home.\n\n${HELP}`).catch(() => {});
     }
@@ -290,6 +356,7 @@ async function handleAdminDecision(env, ownerId, before, state, verb, target, cb
     } else {
       state.pending = state.pending.filter((u) => u.id !== target);
       await saveSettings(env, before, state);
+      await updateRoster(env, [pending], { removed: true });
       note = `❌ ${pending.name} declined.`;
       await send(env, target, "Sorry, the owner didn't approve access to these rain alerts.").catch(() => {});
     }
@@ -300,6 +367,7 @@ async function handleAdminDecision(env, ownerId, before, state, verb, target, cb
       state.approved = state.approved.filter((u) => u.id !== target);
       delete state.chats[target];
       await saveSettings(env, before, state, { removing: [target] });
+      await updateRoster(env, [approved], { removed: true });
       note = `🚫 ${approved.name} removed. They won't get rain alerts any more.`;
       await send(env, target, "Your access to these rain alerts was removed by the owner.").catch(() => {});
     }
