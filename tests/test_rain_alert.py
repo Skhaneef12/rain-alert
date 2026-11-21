@@ -259,6 +259,64 @@ class ForecastOutage(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class TelegramFallback(unittest.TestCase):
+    """Telegram unreachable from GitHub (the 20 Nov ReadTimeouts): the Worker sends instead."""
+
+    def call(self, telegram, worker):
+        calls = []
+
+        def post(url, json=None, timeout=None, headers=None):
+            calls.append(url)
+            if "api.telegram.org" in url:
+                x = telegram
+            else:
+                self.assertEqual(headers, {"authorization": "Bearer s3cret"})
+                x = worker
+            if isinstance(x, Exception):
+                raise x
+            return Resp(x, {"error": "not allowed"} if x == 403 and "api/send" in url and self.deny else {})
+        self.deny = False
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, ENV, clear=False), mock.patch.object(ra.requests, "post", post),              mock.patch.object(ra.time, "sleep"), redirect_stdout(out), redirect_stderr(io.StringIO()) as err:
+            try:
+                result = ra.tg("sendMessage", chat_id=OWNER, text="hi")
+            except ra.TelegramError as e:
+                result = e
+        return result, calls, out.getvalue(), err.getvalue()
+
+    def test_timeouts_then_worker_delivers(self):
+        result, calls, out, _ = self.call(ra.requests.ReadTimeout(), 200)
+        self.assertEqual(result, {})
+        self.assertEqual(sum("api.telegram.org" in c for c in calls), 3)
+        self.assertTrue(calls[-1].endswith("/api/send"))
+        self.assertIn("via the Worker", out)
+
+    def test_server_errors_use_the_worker_too(self):
+        result, calls, _, _ = self.call(502, 200)
+        self.assertEqual(result, {})
+
+    def test_blocked_user_is_not_retried_elsewhere(self):
+        result, calls, _, _ = self.call(403, 200)
+        self.assertIsInstance(result, ra.TelegramError)
+        self.assertEqual(result.status, 403)
+        self.assertFalse(any("api/send" in c for c in calls))
+
+    def test_worker_down_too_is_still_an_error(self):
+        result, calls, _, err = self.call(ra.requests.ReadTimeout(), 502)
+        self.assertIsInstance(result, ra.TelegramError)
+        self.assertNotIn(TOKEN, err)
+
+    def test_worker_relays_a_telegram_refusal(self):
+        result, _, _, _ = self.call(ra.requests.ReadTimeout(), 403)
+        self.assertEqual(result.status, 403)
+
+    def test_only_messages_use_the_backup(self):
+        with mock.patch.dict(os.environ, ENV, clear=False),              mock.patch.object(ra.requests, "post", side_effect=ra.requests.ReadTimeout()) as post,              mock.patch.object(ra.time, "sleep"), redirect_stderr(io.StringIO()):
+            with self.assertRaises(ra.TelegramError):
+                ra.tg("getMe")
+        self.assertEqual(post.call_count, 3)
+
+
 class LateRuns(unittest.TestCase):
     def iso(self, ago):
         return (datetime.now(timezone.utc) - ago).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -345,7 +403,7 @@ class Recipients(unittest.TestCase):
     def test_token_never_printed(self):
         fake = FakeServices()
 
-        def boom(url, json, timeout):
+        def boom(url, json, timeout, headers=None):
             raise ra.requests.ConnectionError(url)
         fake.post = boom
         code, out, err = run(fake, ["--daily"], slots=self.rain)

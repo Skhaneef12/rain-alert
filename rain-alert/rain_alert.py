@@ -275,6 +275,7 @@ def tg(method: str, **payload):
     """Call the Telegram Bot API, retrying network errors, 5xx and 429 (up to 3 attempts)."""
     url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{method}"
     status = 0
+    refused = False  # Telegram answered "no" (e.g. bot blocked): a backup route won't change that
     for attempt in range(3):
         wait = 5
         try:
@@ -295,10 +296,31 @@ def tg(method: str, **payload):
             if resp.status_code == 429:
                 wait = body.get("parameters", {}).get("retry_after", 5)
             elif resp.status_code < 500:
+                refused = True
                 break
         if attempt < 2:
             time.sleep(wait)
+    if method == "sendMessage" and not refused:
+        return send_via_worker(payload, status)
     raise TelegramError(method, status)
+
+
+def send_via_worker(payload: dict, status: int):
+    """Backup when GitHub can't reach Telegram: the Worker (Cloudflare) sends the message instead."""
+    url, secret = os.environ.get("WORKER_URL", "").rstrip("/"), os.environ.get("STATE_SECRET", "")
+    if url and secret:
+        try:
+            resp = requests.post(url + "/api/send", json=payload, timeout=30,
+                                 headers={"authorization": f"Bearer {secret}"})
+            if resp.status_code == 200:
+                print("Telegram unreachable from here; message sent via the Worker route.")
+                return {}
+            print(f"Worker /api/send returned HTTP {resp.status_code}", file=sys.stderr)
+            if 400 <= resp.status_code < 500 and resp.json().get("error") != "not allowed":
+                status = resp.status_code  # Telegram's own refusal, e.g. 403 bot blocked
+        except (requests.RequestException, ValueError) as exc:
+            print(f"Worker /api/send failed: {type(exc).__name__}", file=sys.stderr)
+    raise TelegramError("sendMessage", status)
 
 
 def worker_api(method: str, path: str, **kwargs):
