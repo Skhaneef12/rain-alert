@@ -262,6 +262,28 @@ test("API forecast: Open-Meteo down -> 502, not an empty forecast", async () => 
   assert.equal((await api("/api/forecast")).status, 502);
 });
 
+// ---- backup route for sending messages
+test("API send: delivers to the owner and approved people only, needs the secret", async () => {
+  await approveAna();
+  const ask = (chat, text = "hello") => api("/api/send", { method: "POST", body: { chat_id: chat, text } });
+  assert.equal((await ask(ANA)).status, 200);
+  assert.equal(to(ANA)[0].text, "hello");
+  assert.equal((await ask(OWNER)).status, 200);
+  assert.equal((await ask(EVE)).status, 403); // not a recipient
+  assert.equal((await ask(ANA, "")).status, 403);
+  assert.equal((await api("/api/send", { method: "POST", auth: "Bearer wrong", body: { chat_id: ANA, text: "x" } })).status, 403);
+  assert.equal(to(EVE).length, 0);
+});
+
+test("API send: Telegram refusing (bot blocked) is passed on as 403", async () => {
+  await approveAna();
+  const inner = globalThis.fetch;
+  globalThis.fetch = async (url, o) => String(url).endsWith("/sendMessage")
+    ? json(403, { ok: false, description: "Forbidden: bot was blocked by the user" }) : inner(url, o);
+  const r = await api("/api/send", { method: "POST", body: { chat_id: ANA, text: "hi" } });
+  assert.equal(r.status, 403);
+});
+
 // ---- lost access recovery
 const daily = () => startCheck({ cron: "7 12 * * *", scheduledTime: Date.now() }, env); // an hourly slot
 

@@ -226,6 +226,20 @@ async function handleApi(request, env, url) {
       const ids = [...new Set([...adminIds(env), ...state.approved.map((u) => u.id)])];
       return json(200, { chats: ids.map((id) => ({ id, ...chatSettings(state, id) })) });
     }
+    if (request.method === "POST" && url.pathname === "/api/send") {
+      // Backup route for the GitHub job when it can't reach Telegram: only sendMessage, and only
+      // to the owner and approved people, so the shared secret can't be used to message anyone else.
+      const { chat_id: id, text, reply_markup: markup } = await request.json();
+      const allowed = [...adminIds(env), ...state.approved.map((u) => u.id)];
+      if (!allowed.includes(String(id)) || typeof text !== "string" || !text) return json(403, { error: "not allowed" });
+      try {
+        await send(env, String(id), text, markup);
+        return json(200, { ok: true });
+      } catch (err) {
+        const status = Number(/HTTP (\d{3})/.exec(err?.message || "")?.[1]) || 502;
+        return json(status >= 400 && status < 500 ? status : 502, { error: "telegram refused or unreachable" });
+      }
+    }
     if (request.method === "POST" && url.pathname === "/api/unmute") {
       const { chat_id: id } = await request.json();
       const after = structuredClone(state);
